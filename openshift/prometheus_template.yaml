@@ -1,11 +1,11 @@
-apiVersion: v1
+apiVersion: template.openshift.io/v1
 kind: Template
 metadata:
   name: prometheus
   annotations:
     "openshift.io/display-name": Prometheus
     description: |
-      A monitoring solution for an OpenShift cluster - collect and gather metrics from nodes, services, and the infrastructure.
+      A monitoring solution for an OpenShift cluster - collect and gather metrics and alerts from nodes, services, and the infrastructure.
     iconClass: icon-cogs
     tags: "monitoring,prometheus,time-series"
 parameters:
@@ -14,17 +14,23 @@ parameters:
   value: kube-system
 - description: The location of the proxy image
   name: IMAGE_PROXY
-  value: registry.svc.ci.openshift.org/ci/oauth-proxy:latest
+  value: registry.svc.ci.openshift.org/ci/oauth-proxy:v1
 - description: The location of the prometheus image
+  # TODO: Change to official openshift build
   name: IMAGE_PROMETHEUS
-  value: registry.svc.ci.openshift.org/ci/prometheus:latest
+  value: prom/prometheus
+- description: The location of the alertmanager image
+  name: IMAGE_ALERTMANAGER
+  # TODO: Change to official openshift build
+  value: prom/alertmanager
+- description: The location of message-buffer image
+  name: IMAGE_MESSAGE_BUFFER
+  # TODO: change to official openshift build
+  value: ilackarms/message-buffer
 - description: The session secret for the proxy
   name: SESSION_SECRET
   generate: expression
   from: "[a-zA-Z0-9]{43}"
-- description: The prometheus hostname
-  name: PROMETHEUS_HOSTNAME
-  value: "prometheus.${HOSTNAME}"
 - description: service-signer.crt
   name: SERVICE_SIGNER_CERT
 objects:
@@ -36,7 +42,7 @@ objects:
     namespace: "${NAMESPACE}"
     annotations:
       serviceaccounts.openshift.io/oauth-redirectreference.primary: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"prometheus"}}'
-- apiVersion: v1
+- apiVersion: authorization.openshift.io/v1
   kind: ClusterRoleBinding
   metadata:
     name: prometheus-cluster-reader
@@ -46,14 +52,15 @@ objects:
   - kind: ServiceAccount
     name: prometheus
     namespace: "${NAMESPACE}"
+
 # Create a fully end-to-end TLS connection to the proxy
-- apiVersion: v1
+- apiVersion: route.openshift.io/v1
   kind: Route
   metadata:
     name: prometheus
     namespace: "${NAMESPACE}"
   spec:
-    host: "${PROMETHEUS_HOSTNAME}"
+#    host: "${PROMETHEUS_HOSTNAME}"
     to:
       name: prometheus
     tls:
@@ -124,8 +131,8 @@ objects:
           - -tls-key=/etc/tls/private/tls.key
           - -client-secret-file=/var/run/secrets/kubernetes.io/serviceaccount/token
           - -cookie-secret-file=/etc/proxy/secrets/session_secret
-#          - -skip-auth-regex=^/metrics
-          - -skip-auth-regex=^/
+          - -skip-auth-regex=^/metrics
+          - '-openshift-delegate-urls={"/": {"resource": "namespaces", "verb": "get", "name": "${NAMESPACE}"}}'
           volumeMounts:
           - mountPath: /etc/tls/private
             name: prometheus-tls
@@ -134,6 +141,7 @@ objects:
 
         - name: prometheus
           args:
+          - -storage.local.retention=6h
           - -config.file=/etc/prometheus/prometheus.yml
           - -web.listen-address=localhost:9090
           image: ${IMAGE_PROMETHEUS}
@@ -164,7 +172,20 @@ objects:
     name: prometheus
     namespace: "${NAMESPACE}"
   data:
+    prometheus.rules: |
+      ALERT Testing
+        IF container_fs_usage_bytes{container_name="",device="/dev/mapper/vg0-lv_root"} > 40000000
+        ANNOTATIONS {
+          source = "ManageIQ",
+          severity = "HIGH",
+          url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+          message = "Node about to explode!",
+          description = "a description"
+        }
     prometheus.yml: |
+      rule_files:
+        - 'prometheus.rules'
+
       # A scrape configuration for running Prometheus on a Kubernetes cluster.
       # This uses separate scrape configs for cluster components (i.e. API server, node)
       # and services to allow each to use different authentication configs.
@@ -299,3 +320,198 @@ objects:
           action: replace
           target_label: kubernetes_name
 
+      alerting:
+        alertmanagers:
+        - scheme: http
+          static_configs:
+          - targets:
+            - "alertmanager:9093"
+
+# Create a fully end-to-end TLS connection to the proxy
+- apiVersion: route.openshift.io/v1
+  kind: Route
+  metadata:
+    name: alerts
+    namespace: "${NAMESPACE}"
+  spec:
+    to:
+      name: alerts
+    tls:
+      termination: Reencrypt
+      destinationCACertificate: "${SERVICE_SIGNER_CERT}"
+
+# Temporary route to alertmanager
+- apiVersion: v1
+  kind: Route
+  metadata:
+    name: alertmanager
+    namespace: "${NAMESPACE}"
+  spec:
+    port:
+      targetPort: alertmanager
+    to:
+      kind: Service
+      name: alertmanager
+      weight: 100
+    wildcardPolicy: None
+
+# Create a service to access alerts vi auth-proxy
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      service.alpha.openshift.io/serving-cert-secret-name: alerts-tls
+    labels:
+      name: alerts
+    name: alerts
+    namespace: "${NAMESPACE}"
+  spec:
+    ports:
+    - name: alerts
+      port: 443
+      protocol: TCP
+      targetPort: 8443
+    selector:
+      app: alerts
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: alerts-proxy
+    namespace: "${NAMESPACE}"
+  stringData:
+    session_secret: "${SESSION_SECRET}="
+
+# Create an internal direct service to alertmanager app
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      prometheus.io/scrape: "true"
+    labels:
+      name: alertmanager
+    name: alertmanager
+    namespace: "${NAMESPACE}"
+  spec:
+    ports:
+    - name: alertmanager
+      port: 9093
+      protocol: TCP
+      targetPort: 9093
+    selector:
+      app: alerts
+
+# Deploy AlertManager behind MessageBuffer behind an oauth proxy
+- apiVersion: extensions/v1beta1
+  kind: Deployment
+  metadata:
+    labels:
+      app: alerts
+    name: alerts
+    namespace: "${NAMESPACE}"
+  spec:
+    replicas: 1
+    selector:
+      matchLabels:
+        app: alerts
+    template:
+      metadata:
+        labels:
+          app: alerts
+        name: alerts
+      spec:
+        serviceAccountName: prometheus
+        containers:
+        - name: oauth-proxy
+          image: ${IMAGE_PROXY}
+          imagePullPolicy: IfNotPresent
+          ports:
+          - containerPort: 8443
+            name: web
+          args:
+          - -https-address=:8443
+          - -email-domain=*
+          - -client-id=system:serviceaccount:${NAMESPACE}:prometheus
+          - -upstream=http://localhost:9099
+          - -provider=openshift
+          - -redirect-url=https:///oauth2/callback
+          - '-openshift-sar={"namespace": "${NAMESPACE}", "verb": "list", "resource": "services"}'
+          - -tls-cert=/etc/tls/private/tls.crt
+          - -tls-key=/etc/tls/private/tls.key
+          - -client-secret-file=/var/run/secrets/kubernetes.io/serviceaccount/token
+          - -cookie-secret-file=/etc/proxy/secrets/session_secret
+          - '-openshift-delegate-urls={"/": {"resource": "namespaces", "verb": "get", "name": "${NAMESPACE}"}}'
+          volumeMounts:
+          - mountPath: /etc/tls/private
+            name: alerts-tls
+          - mountPath: /etc/proxy/secrets
+            name: secrets
+
+        - name: message-buffer
+          args:
+#          - -listen-address=localhost:9099
+          image: ${IMAGE_MESSAGE_BUFFER}
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+          - mountPath: /message-buffer
+            name: message-buffer-data
+          ports:
+          - containerPort: 9099
+            name: message-buf
+
+        - name: alertmanager
+          args:
+          - -config.file=/etc/alertmanager/alertmanager.yml
+          image: ${IMAGE_ALERTMANAGER}
+          imagePullPolicy: IfNotPresent
+          ports:
+          - containerPort: 9093
+            name: web
+          volumeMounts:
+          - mountPath: /etc/alertmanager
+            name: alertmanager-config
+          - mountPath: /alertmanager
+            name: alertmanager-data
+
+        restartPolicy: Always
+        volumes:
+        - configMap:
+            defaultMode: 420
+            name: alertmanager
+          name: alertmanager-config
+        - name: secrets
+          secret:
+            secretName: alerts-proxy
+        - name: alerts-tls
+          secret:
+            secretName: alerts-tls
+        - emptyDir: {}
+          name: alertmanager-data
+        - emptyDir: {}
+          name: message-buffer-data #TODO: make persistent
+- apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: alertmanager
+    namespace: "${NAMESPACE}"
+  data:
+    alertmanager.yml: |
+      global:
+
+      # The root route on which each incoming alert enters.
+      route:
+        # default route if none match
+        receiver: message-buffer-wh
+
+        # The labels by which incoming alerts are grouped together. For example,
+        # multiple alerts coming in for cluster=A and alertname=LatencyHigh would
+        # be batched into a single group.
+        # TODO:
+        group_by: []
+
+        # All the above attributes are inherited by all child routes and can
+        # overwritten on each.
+
+      receivers:
+      - name: message-buffer-wh
+        webhook_configs:
+        - url: http://localhost:9099/topics/alerts
