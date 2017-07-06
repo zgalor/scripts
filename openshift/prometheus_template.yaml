@@ -14,7 +14,7 @@ parameters:
   value: kube-system
 - description: The location of the proxy image
   name: IMAGE_PROXY
-  value: registry.svc.ci.openshift.org/ci/oauth-proxy:v1
+  value: openshift/oauth-proxy:v1.0.0
 - description: The location of the prometheus image
   # TODO: Change to official openshift build
   name: IMAGE_PROMETHEUS
