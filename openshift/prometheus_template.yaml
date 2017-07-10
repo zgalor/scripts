@@ -18,7 +18,7 @@ parameters:
 - description: The location of the prometheus image
   # TODO: Change to official openshift build
   name: IMAGE_PROMETHEUS
-  value: prom/prometheus
+  value: openshift/prometheus:v2.0.0-dev
 - description: The location of the alertmanager image
   name: IMAGE_ALERTMANAGER
   # TODO: Change to official openshift build
@@ -141,9 +141,9 @@ objects:
 
         - name: prometheus
           args:
-          - -storage.local.retention=6h
-          - -config.file=/etc/prometheus/prometheus.yml
-          - -web.listen-address=localhost:9090
+          - --storage.tsdb.retention=6h
+          - --config.file=/etc/prometheus/prometheus.yml
+          - --web.listen-address=localhost:9090
           image: ${IMAGE_PROMETHEUS}
           imagePullPolicy: IfNotPresent
           volumeMounts:
@@ -173,15 +173,19 @@ objects:
     namespace: "${NAMESPACE}"
   data:
     prometheus.rules: |
-      ALERT Testing
-        IF container_fs_usage_bytes{container_name="",device="/dev/mapper/vg0-lv_root"} > 40000000
-        ANNOTATIONS {
-          source = "ManageIQ",
-          severity = "HIGH",
-          url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-          message = "Node about to explode!",
-          description = "a description"
-        }
+      groups:
+      - name: example-rules
+        interval: 30s # defaults to global interval
+        rules:
+        - alert: Testing
+          expr: container_fs_usage_bytes{container_name="",device="/dev/mapper/vg0-lv_root"} > 40000000
+          # for some reason annotations fail parsing
+#          annotations:
+#            source: "ManageIQ",
+#            severity: "HIGH",
+#            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+#            message: "Node about to explode!",
+#            description: "a description"
     prometheus.yml: |
       rule_files:
         - 'prometheus.rules'
